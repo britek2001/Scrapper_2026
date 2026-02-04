@@ -1,0 +1,11 @@
+CONTENT EXTRACTION REPORT
+Generated: 2026-01-30 11:25:05
+============================================================
+
+Total URLs processed: 9
+Successful extractions: 0
+Failed extractions: 9
+Success rate: 0.0%
+Redirected URLs: 0
+Total words extracted: 0
+Total lines extracted: 0

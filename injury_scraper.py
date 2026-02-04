@@ -1,417 +1,652 @@
 import requests
 import time
-import json
-import logging
 import re
+import json
 from datetime import datetime
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
+import logging
 from bs4 import BeautifulSoup
+import cloudscraper  # Alternative to requests that bypasses Cloudflare
+from urllib.parse import urlparse, parse_qs
 
-class InjuryScraper:
-    """Scraper for football player injuries and fitness news"""
+class AdvancedTransfermarktScraper:
+    """Advanced Transfermarkt scraper with better parsing logic and error handling"""
     
-    def __init__(self):
+    def __init__(self, use_cloudscraper=True):
         self.setup_logging()
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-        })
+        self.use_cloudscraper = use_cloudscraper
         
-        self.premier_league_clubs = [
-            'Arsenal', 'Aston Villa', 'Bournemouth', 'Brentford', 'Brighton',
-            'Chelsea', 'Crystal Palace', 'Everton', 'Fulham', 'Ipswich',
-            'Leicester', 'Liverpool', 'Manchester City', 'Manchester United',
-            'Newcastle', 'Nottingham Forest', 'Southampton', 'Tottenham',
-            'West Ham', 'Wolverhampton', 'Wolves', 'Burnley', 'AFC Bournemouth',
-            'Brighton & Hove Albion', 'Leeds United', 'Tottenham Hotspur',
-            'Wolverhampton Wanderers', 'West Ham United', 'Sunderland'
-        ]
-    
+        if use_cloudscraper:
+            self.session = cloudscraper.create_scraper(
+                browser={
+                    'browser': 'chrome',
+                    'platform': 'windows',
+                    'mobile': False
+                }
+            )
+        else:
+            self.session = requests.Session()
+        
+        # Enhanced headers
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Cache-Control': 'max-age=0',
+            'TE': 'trailers'
+        }
+        
+        self.session.headers.update(self.headers)
+        
+        # Rate limiting
+        self.request_delay = 1.5
+        self.last_request_time = 0
+        
+        # Base URLs with different endpoints
+        self.base_url = "https://www.transfermarkt.com"
+        self.endpoints = {
+            'profile': "/spieler/{id}",
+            'injury': "/verletzungen/spieler/{id}",
+            'performance': "/leistungsdaten/spieler/{id}",
+            'transfer_history': "/transfers/spieler/{id}",
+            'timeline': "/profil/spieler/{id}"
+        }
+        
     def setup_logging(self):
-        """Configure logging"""
         logging.basicConfig(
             level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s'
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler('transfermarkt_scraper.log'),
+                logging.StreamHandler()
+            ]
         )
         self.logger = logging.getLogger(__name__)
     
-    def _is_valid_player_name(self, name: str) -> bool:
-        """Check if string is a valid player name"""
-        if not name or len(name) < 3:
-            return False
+    def _rate_limit(self):
+        """Implement rate limiting between requests"""
+        current_time = time.time()
+        time_since_last = current_time - self.last_request_time
         
-        # Filter out club names (CRITICAL!)
-        for club in self.premier_league_clubs:
-            if club.lower() == name.lower() or club.lower() in name.lower():
-                return False
+        if time_since_last < self.request_delay:
+            time.sleep(self.request_delay - time_since_last)
         
-        # Filter out numbers only
-        if name.replace(' ', '').replace('×', '').isdigit():
-            return False
-        
-        # Filter out common non-player strings
-        invalid_patterns = ['Total', 'Injured', 'Summary', 'Table', 'Position', 'Unknown', 
-                           'Premier League', 'Championship']
-        if any(pattern.lower() in name.lower() for pattern in invalid_patterns):
-            return False
-        
-        # Filter out lists (contains commas)
-        if ',' in name:
-            return False
-        
-        return True
+        self.last_request_time = time.time()
     
-    def scrape_physioroom(self) -> List[Dict]:
-        """Scrape PhysioRoom - FIXED VERSION"""
-        self.logger.info("Scraping PhysioRoom...")
-        injuries = []
+    def _make_request(self, url: str, max_retries: int = 3) -> Optional[BeautifulSoup]:
+        """Make HTTP request with retry logic and error handling"""
+        for attempt in range(max_retries):
+            try:
+                self._rate_limit()
+                
+                self.logger.debug(f"Requesting {url} (attempt {attempt + 1}/{max_retries})")
+                response = self.session.get(url, timeout=15)
+                response.raise_for_status()
+                
+                # Check if we got a valid HTML response
+                if not response.text or len(response.text) < 1000:
+                    self.logger.warning(f"Short response received from {url}")
+                    if attempt < max_retries - 1:
+                        time.sleep(2 ** attempt)  # Exponential backoff
+                        continue
+                
+                soup = BeautifulSoup(response.text, 'html.parser')
+                
+                # Check for common error indicators
+                error_indicators = [
+                    'Access denied',
+                    'Cloudflare',
+                    'captcha',
+                    '403 Forbidden',
+                    '404 Not Found'
+                ]
+                
+                page_text = soup.text.lower()
+                for indicator in error_indicators:
+                    if indicator.lower() in page_text:
+                        self.logger.warning(f"Error indicator found: {indicator}")
+                        if attempt < max_retries - 1:
+                            time.sleep(2 ** attempt)
+                            continue
+                
+                return soup
+                
+            except requests.exceptions.RequestException as e:
+                self.logger.error(f"Request failed (attempt {attempt + 1}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                else:
+                    raise
+    
+    def scrape_player(self, player_id: str) -> Dict:
+        """Main method to scrape complete player data"""
+        
+        self.logger.info(f"Starting scrape for player ID: {player_id}")
+        
+        player_data = {
+            'player_id': player_id,
+            'source_urls': {},
+            'scraped_at': datetime.now().isoformat(),
+            'personal_info': {},
+            'club_info': {},
+            'market_value': {},
+            'injury_history': [],
+            'career_stats': [],
+            'titles': [],
+            'transfers': [],
+            'performance_data': []
+        }
         
         try:
-            # Try the main EPL injury page
-            url = "https://www.physioroom.com/news/english_premier_league/epl_injury_table.php"
-            response = self.session.get(url, timeout=15)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.content, 'lxml')
+            # Get all necessary pages
+            profile_soup = self._scrape_profile_page(player_id)
+            if profile_soup:
+                player_data['personal_info'] = self._extract_personal_info(profile_soup)
+                player_data['club_info'] = self._extract_club_info(profile_soup)
+                player_data['market_value'] = self._extract_market_value(profile_soup)
+                player_data['titles'] = self._extract_titles(profile_soup)
             
-            # Save HTML for inspection
-            with open('debug_physioroom.html', 'w', encoding='utf-8') as f:
-                f.write(str(soup.prettify()))
-            self.logger.info("Saved HTML to debug_physioroom.html")
+            # Get performance data page (contains detailed stats)
+            performance_soup = self._scrape_performance_page(player_id)
+            if performance_soup:
+                player_data['career_stats'] = self._extract_detailed_stats(performance_soup)
+                player_data['transfers'] = self._extract_transfer_history(performance_soup)
             
-            # Strategy: Look for injury data in divs or tables
-            # Find all links to individual club injury pages
-            club_links = soup.select('a[href*="injury"]')
+            # Get injury data
+            injury_soup = self._scrape_injury_page(player_id)
+            if injury_soup:
+                player_data['injury_history'] = self._extract_injury_history(injury_soup)
             
-            self.logger.info(f"Found {len(club_links)} potential club injury links")
-            
-            # Alternative: Parse from visible content
-            # Look for player names followed by injury info
-            content_divs = soup.find_all(['div', 'p', 'span'], text=re.compile(r'[A-Z][a-z]+\s+[A-Z][a-z]+'))
-            
-            for div in content_divs[:50]:
-                text = div.get_text(strip=True)
-                
-                # Look for pattern: Player Name - Injury Type
-                if '-' in text or ',' in text:
-                    parts = re.split(r'[-,]', text)
-                    if len(parts) >= 2:
-                        player_name = parts[0].strip()
-                        injury_type = parts[1].strip()
-                        
-                        if self._is_valid_player_name(player_name):
-                            injury = {
-                                'source': 'PhysioRoom',
-                                'club': 'Unknown',
-                                'player': player_name,
-                                'injury_type': injury_type,
-                                'expected_return': 'Unknown',
-                                'status': 'Active',
-                                'scraped_at': datetime.now().isoformat()
-                            }
-                            injuries.append(injury)
-                            self.logger.info(f"✅ {player_name} - {injury_type}")
+            self.logger.info(f"Successfully scraped data for player {player_id}")
             
         except Exception as e:
-            self.logger.error(f"Error scraping PhysioRoom: {e}")
+            self.logger.error(f"Error during scrape: {e}")
+            # Save partial data if available
+            if player_data['personal_info'].get('name') == 'Unknown':
+                self.logger.error("Failed to extract any data")
         
-        # If PhysioRoom fails, use Premier League official as fallback
-        if not injuries:
-            self.logger.info("PhysioRoom returned no data, trying Premier League API...")
-            return self.scrape_premier_league_api()
-        
-        return injuries
+        return player_data
     
-    def scrape_premier_league_api(self) -> List[Dict]:
-        """Scrape Premier League official injuries"""
-        self.logger.info("Scraping Premier League API...")
+    def _scrape_profile_page(self, player_id: str) -> Optional[BeautifulSoup]:
+        """Scrape the main profile page"""
+        url = f"{self.base_url}{self.endpoints['profile'].format(id=player_id)}"
+        self.logger.info(f"Scraping profile page: {url}")
+        
+        soup = self._make_request(url)
+        if soup:
+            self._save_html_for_debug(soup, f"profile_{player_id}")
+            return soup
+        return None
+    
+    def _scrape_performance_page(self, player_id: str) -> Optional[BeautifulSoup]:
+        """Scrape the performance data page"""
+        url = f"{self.base_url}{self.endpoints['performance'].format(id=player_id)}"
+        self.logger.info(f"Scraping performance page: {url}")
+        
+        soup = self._make_request(url)
+        if soup:
+            self._save_html_for_debug(soup, f"performance_{player_id}")
+            return soup
+        return None
+    
+    def _scrape_injury_page(self, player_id: str) -> Optional[BeautifulSoup]:
+        """Scrape the injury history page"""
+        url = f"{self.base_url}{self.endpoints['injury'].format(id=player_id)}"
+        self.logger.info(f"Scraping injury page: {url}")
+        
+        soup = self._make_request(url)
+        if soup:
+            self._save_html_for_debug(soup, f"injury_{player_id}")
+            return soup
+        return None
+    
+    def _save_html_for_debug(self, soup: BeautifulSoup, filename: str):
+        """Save HTML for debugging purposes"""
+        try:
+            with open(f'debug_{filename}.html', 'w', encoding='utf-8') as f:
+                f.write(soup.prettify())
+        except Exception as e:
+            self.logger.warning(f"Could not save debug HTML: {e}")
+    
+    def _extract_personal_info(self, soup: BeautifulSoup) -> Dict:
+        """Extract personal information with multiple fallback strategies"""
+        info = {
+            'name': 'Unknown',
+            'full_name': 'Unknown',
+            'date_of_birth': None,
+            'age': None,
+            'place_of_birth': None,
+            'nationality': [],
+            'height': None,
+            'position': [],
+            'preferred_foot': None,
+            'agent': None,
+            'international_caps': 0,
+            'international_goals': 0,
+            'other_names': []
+        }
+        
+        try:
+            # Strategy 1: Try to get name from header
+            header = soup.find('h1', class_='data-header__headline-wrapper')
+            if header:
+                name_text = header.text.strip()
+                # Remove shirt number if present
+                name_text = re.sub(r'#\d+', '', name_text).strip()
+                info['name'] = name_text
+            
+            # Strategy 2: Fallback to meta tags
+            if info['name'] == 'Unknown':
+                meta_name = soup.find('meta', property='og:title')
+                if meta_name and 'content' in meta_name.attrs:
+                    title = meta_name['content']
+                    # Extract name from "Name - Profile | Transfermarkt"
+                    if '-' in title:
+                        info['name'] = title.split('-')[0].strip()
+            
+            # Extract data from info table
+            info_table = soup.find('div', class_='info-table')
+            if not info_table:
+                info_table = soup.find('table', class_='auflistung')
+            
+            if info_table:
+                rows = info_table.find_all('tr')
+                for row in rows:
+                    cells = row.find_all('td')
+                    if len(cells) >= 2:
+                        label = cells[0].text.strip().lower()
+                        value = cells[1].text.strip()
+                        
+                        if 'date of birth' in label or 'geburtstag' in label:
+                            info['date_of_birth'], info['age'] = self._parse_date_of_birth(value)
+                        
+                        elif 'place of birth' in label or 'geburtsort' in label:
+                            info['place_of_birth'] = value
+                        
+                        elif 'citizenship' in label or 'staatsangehörigkeit' in label:
+                            # Extract nationalities from flags or text
+                            flags = cells[1].find_all('img', class_='flaggenrahmen')
+                            if flags:
+                                info['nationality'] = [self._extract_country_from_flag(img) for img in flags]
+                            else:
+                                info['nationality'] = [v.strip() for v in value.split(',')]
+                        
+                        elif 'height' in label or 'größe' in label:
+                            info['height'] = self._parse_height(value)
+                        
+                        elif 'position' in label:
+                            positions = value.split(',')
+                            info['position'] = [pos.strip() for pos in positions]
+                        
+                        elif 'foot' in label or 'fuß' in label:
+                            info['preferred_foot'] = value
+                        
+                        elif 'agent' in label or 'spielerberater' in label:
+                            info['agent'] = value
+                        
+                        elif 'caps/goals' in label or 'länderspiele/tore' in label:
+                            caps_goals = self._parse_caps_goals(value)
+                            if caps_goals:
+                                info['international_caps'], info['international_goals'] = caps_goals
+            
+            # Additional extraction for full name
+            full_name_elem = soup.find('span', string=re.compile('Full name'))
+            if full_name_elem:
+                full_name_row = full_name_elem.find_parent('tr')
+                if full_name_row:
+                    full_name_cell = full_name_row.find_all('td')[1]
+                    if full_name_cell:
+                        info['full_name'] = full_name_cell.text.strip()
+            
+            # If full name still unknown, use name
+            if info['full_name'] == 'Unknown':
+                info['full_name'] = info['name']
+            
+        except Exception as e:
+            self.logger.error(f"Error extracting personal info: {e}")
+        
+        return info
+    
+    def _parse_date_of_birth(self, value: str) -> Tuple[Optional[str], Optional[int]]:
+        """Parse date of birth and age from string"""
+        try:
+            # Format: "Nov 4, 1998 (25)"
+            date_match = re.search(r'([A-Za-z]+\s*\d{1,2},\s*\d{4})', value)
+            age_match = re.search(r'\((\d+)\)', value)
+            
+            date_str = None
+            age = None
+            
+            if date_match:
+                date_str = date_match.group(1)
+            
+            if age_match:
+                age = int(age_match.group(1))
+            
+            return date_str, age
+        except:
+            return None, None
+    
+    def _extract_country_from_flag(self, img_element) -> str:
+        """Extract country name from flag image"""
+        try:
+            alt_text = img_element.get('alt', '')
+            title_text = img_element.get('title', '')
+            
+            if alt_text:
+                return alt_text
+            elif title_text:
+                return title_text
+            else:
+                # Try to extract from src
+                src = img_element.get('src', '')
+                if 'flagge' in src.lower():
+                    match = re.search(r'flagge/([^/]+)', src)
+                    if match:
+                        return match.group(1).replace('_', ' ').title()
+        except:
+            pass
+        return "Unknown"
+    
+    def _parse_height(self, value: str) -> str:
+        """Parse height from string"""
+        # Format: "1,81 m" or "5'11""
+        clean_value = value.strip()
+        return clean_value
+    
+    def _parse_caps_goals(self, value: str) -> Optional[Tuple[int, int]]:
+        """Parse caps and goals from string"""
+        # Format: "24/5" or "24 / 5"
+        match = re.search(r'(\d+)\s*/\s*(\d+)', value)
+        if match:
+            return int(match.group(1)), int(match.group(2))
+        return None
+    
+    def _extract_club_info(self, soup: BeautifulSoup) -> Dict:
+        """Extract current club information"""
+        club_info = {
+            'current_club': 'Unknown',
+            'club_nationality': 'Unknown',
+            'league': 'Unknown',
+            'division': 'Unknown',
+            'joined': None,
+            'contract_until': None,
+            'shirt_number': None
+        }
+        
+        try:
+            # Find current club info
+            club_box = soup.find('div', class_='data-header__club-info')
+            if club_box:
+                club_link = club_box.find('a')
+                if club_link:
+                    club_info['current_club'] = club_link.text.strip()
+            
+            # Find contract info
+            contract_info = soup.find('span', class_='data-header__label', string=re.compile('Contract'))
+            if contract_info:
+                contract_value = contract_info.find_next('span', class_='data-header__content')
+                if contract_value:
+                    contract_text = contract_value.text.strip()
+                    # Parse "Jun 30, 2029" format
+                    club_info['contract_until'] = contract_text
+            
+            # Find shirt number
+            shirt_number = soup.find('div', class_='data-header__shirt-number')
+            if shirt_number:
+                number_text = shirt_number.text.strip()
+                number_match = re.search(r'#\s*(\d+)', number_text)
+                if number_match:
+                    club_info['shirt_number'] = number_match.group(1)
+            
+            # Joined date might be in transfer history
+            joined_elem = soup.find('span', string=re.compile('Joined'))
+            if joined_elem:
+                joined_value = joined_elem.find_next('span')
+                if joined_value:
+                    club_info['joined'] = joined_value.text.strip()
+        
+        except Exception as e:
+            self.logger.error(f"Error extracting club info: {e}")
+        
+        return club_info
+    
+    def _extract_market_value(self, soup: BeautifulSoup) -> Dict:
+        """Extract market value information"""
+        market_value = {
+            'current_value': 'Unknown',
+            'value_currency': '€',
+            'value_history': [],
+            'peak_value': 'Unknown',
+            'peak_date': 'Unknown'
+        }
+        
+        try:
+            # Find current market value
+            value_elem = soup.find('div', class_='tm-player-market-value-development__current-value')
+            if value_elem:
+                value_text = value_elem.text.strip()
+                match = re.search(r'([\d.,]+)\s*(\w*)', value_text)
+                if match:
+                    market_value['current_value'] = match.group(1)
+                    if match.group(2):
+                        market_value['value_currency'] = match.group(2)
+            
+            # Try alternative selector
+            if market_value['current_value'] == 'Unknown':
+                market_elem = soup.find('a', class_='data-header__market-value-wrapper')
+                if market_elem:
+                    value_text = market_elem.text.strip()
+                    match = re.search(r'([\d.,]+)\s*(\w*)', value_text)
+                    if match:
+                        market_value['current_value'] = match.group(1)
+        
+        except Exception as e:
+            self.logger.error(f"Error extracting market value: {e}")
+        
+        return market_value
+    
+    def _extract_detailed_stats(self, soup: BeautifulSoup) -> List[Dict]:
+        """Extract detailed career statistics"""
+        stats = []
+        
+        try:
+            # Find the main stats table
+            table = soup.find('table', class_='items')
+            if table:
+                rows = table.find_all('tr')[1:]  # Skip header row
+                
+                for row in rows:
+                    cells = row.find_all('td')
+                    if len(cells) > 5:
+                        season_stats = {
+                            'season': cells[0].text.strip() if cells[0].text.strip() else None,
+                            'club': cells[1].text.strip() if cells[1].text.strip() else None,
+                            'competition': cells[2].text.strip() if cells[2].text.strip() else None,
+                            'appearances': cells[3].text.strip() if cells[3].text.strip() else '0',
+                            'goals': cells[4].text.strip() if cells[4].text.strip() else '0',
+                            'assists': cells[5].text.strip() if cells[5].text.strip() else '0'
+                        }
+                        
+                        # Clean up numeric values
+                        for key in ['appearances', 'goals', 'assists']:
+                            if season_stats[key]:
+                                season_stats[key] = re.sub(r'[^\d]', '', season_stats[key])
+                                season_stats[key] = int(season_stats[key]) if season_stats[key] else 0
+                        
+                        stats.append(season_stats)
+        
+        except Exception as e:
+            self.logger.error(f"Error extracting detailed stats: {e}")
+        
+        return stats
+    
+    def _extract_transfer_history(self, soup: BeautifulSoup) -> List[Dict]:
+        """Extract transfer history"""
+        transfers = []
+        
+        try:
+            # Find transfer history table
+            table = soup.find('table', class_='transfer-history')
+            if not table:
+                # Try alternative selector
+                table = soup.find('div', id='transfers')
+                if table:
+                    table = table.find('table')
+            
+            if table:
+                rows = table.find_all('tr')[1:]  # Skip header
+                
+                for row in rows:
+                    cells = row.find_all('td')
+                    if len(cells) >= 8:
+                        transfer = {
+                            'season': cells[0].text.strip(),
+                            'date': cells[1].text.strip(),
+                            'from_club': cells[2].text.strip(),
+                            'to_club': cells[3].text.strip(),
+                            'market_value': cells[4].text.strip(),
+                            'fee': cells[5].text.strip()
+                        }
+                        transfers.append(transfer)
+        
+        except Exception as e:
+            self.logger.error(f"Error extracting transfer history: {e}")
+        
+        return transfers
+    
+    def _extract_injury_history(self, soup: BeautifulSoup) -> List[Dict]:
+        """Extract injury history"""
         injuries = []
         
         try:
-            # Try API first
-            api_url = "https://footballapi.pulselive.com/football/stats/injuries"
-            headers = {
-                'Origin': 'https://www.premierleague.com',
-                'Referer': 'https://www.premierleague.com/'
-            }
-            
-            params = {'comps': '1', 'compSeasons': '578'}
-            
-            response = self.session.get(api_url, headers=headers, params=params, timeout=10)
-            
-            if response.status_code == 200:
-                data = response.json()
+            injury_table = soup.find('table', class_='items')
+            if injury_table:
+                rows = injury_table.find_all('tr')[1:]  # Skip header
                 
-                for item in data.get('content', []):
-                    player_name = item.get('name', {}).get('display', '')
-                    
-                    if self._is_valid_player_name(player_name):
+                for row in rows:
+                    cells = row.find_all('td')
+                    if len(cells) >= 5:
                         injury = {
-                            'source': 'Premier League Official',
-                            'player': player_name,
-                            'club': item.get('team', {}).get('name', 'Unknown'),
-                            'injury_type': item.get('reason', 'Unknown'),
-                            'expected_return': item.get('expectedReturn', 'Unknown'),
-                            'status': 'Active',
-                            'scraped_at': datetime.now().isoformat()
+                            'season': cells[0].text.strip(),
+                            'injury': cells[1].text.strip(),
+                            'from_date': cells[2].text.strip(),
+                            'until_date': cells[3].text.strip(),
+                            'days_out': cells[4].text.strip(),
+                            'games_missed': cells[5].text.strip() if len(cells) > 5 else '0'
                         }
                         injuries.append(injury)
-                        self.logger.info(f"✅ {player_name} - {injury['injury_type']}")
-                        
+        
         except Exception as e:
-            self.logger.error(f"Error scraping Premier League: {e}")
+            self.logger.error(f"Error extracting injury history: {e}")
         
         return injuries
     
-    def scrape_espn_injuries(self) -> List[Dict]:
-        """Scrape ESPN injury report"""
-        self.logger.info("Scraping ESPN injuries...")
-        injuries = []
+    def _extract_titles(self, soup: BeautifulSoup) -> List[str]:
+        """Extract titles/honors"""
+        titles = []
         
         try:
-            response = self.session.get("https://www.espn.com/soccer/injuries/_/league/eng.1", timeout=10)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.content, 'lxml')
-            
-            # ESPN injury table structure
-            tables = soup.select('div.ResponsiveTable, table.Table')
-            
-            for table in tables:
-                rows = table.select('tr.Table__TR')
-                
-                for row in rows:
-                    try:
-                        cells = row.find_all('td')
-                        
-                        if len(cells) >= 2:
-                            # First cell usually has player info
-                            player_cell = cells[0]
-                            player_name = player_cell.get_text(strip=True)
-                            
-                            # Extract actual player name (remove position, team, etc)
-                            player_name = re.sub(r'[A-Z]{2,3}$', '', player_name).strip()
-                            player_name = re.sub(r'\d+', '', player_name).strip()
-                            
-                            if self._is_valid_player_name(player_name):
-                                injury_type = cells[1].get_text(strip=True) if len(cells) > 1 else 'Unknown'
-                                status = cells[2].get_text(strip=True) if len(cells) > 2 else 'Unknown'
-                                
-                                injury = {
-                                    'source': 'ESPN',
-                                    'club': 'Premier League',
-                                    'player': player_name,
-                                    'injury_type': injury_type,
-                                    'status': status,
-                                    'expected_return': status,
-                                    'scraped_at': datetime.now().isoformat()
-                                }
-                                injuries.append(injury)
-                                self.logger.info(f"✅ {player_name} - {injury_type}")
-                    except Exception as e:
-                        continue
-            
+            titles_section = soup.find('div', class_='data-header__badge-container')
+            if titles_section:
+                badges = titles_section.find_all('img', class_='data-header__badge-icon')
+                for badge in badges:
+                    alt_text = badge.get('alt', '')
+                    if alt_text:
+                        titles.append(alt_text)
+        
         except Exception as e:
-            self.logger.error(f"Error scraping ESPN: {e}")
+            self.logger.error(f"Error extracting titles: {e}")
         
-        return injuries
+        return titles
     
-    def scrape_sky_sports_injuries(self) -> List[Dict]:
-        """Scrape Sky Sports injury news"""
-        self.logger.info("Scraping Sky Sports injury news...")
-        injuries = []
+    def save_as_json(self, player_data: Dict, filename: str = None):
+        """Save scraped data as JSON file"""
+        if filename is None:
+            player_name = player_data['personal_info'].get('name', 'player')
+            safe_name = re.sub(r'[^\w\s]', '', player_name).replace(' ', '_')
+            filename = f"{safe_name}_{player_data['player_id']}.json"
         
-        try:
-            response = self.session.get("https://www.skysports.com/football/news/11095", timeout=10)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.content, 'lxml')
-            articles = soup.select('div.news-list__item')
-            injury_keywords = ['injury', 'fitness', 'injured', 'sidelined', 'ruled out', 'doubt', 'return']
-            
-            for article in articles[:20]:
-                try:
-                    headline = article.select_one('h3, h4')
-                    if not headline:
-                        continue
-                    
-                    title = headline.get_text(strip=True)
-                    title_lower = title.lower()
-                    
-                    if any(keyword in title_lower for keyword in injury_keywords):
-                        link_elem = article.select_one('a')
-                        url = link_elem.get('href', '') if link_elem else ''
-                        if url and not url.startswith('http'):
-                            url = 'https://www.skysports.com' + url
-                        
-                        summary_elem = article.select_one('p')
-                        summary = summary_elem.get_text(strip=True) if summary_elem else ''
-                        
-                        injury_news = {
-                            'source': 'Sky Sports',
-                            'title': title,
-                            'summary': summary,
-                            'url': url,
-                            'type': 'news_article',
-                            'scraped_at': datetime.now().isoformat()
-                        }
-                        injuries.append(injury_news)
-                        self.logger.info(f"✅ News: {title[:60]}...")
-                        
-                except Exception as e:
-                    continue
-                    
-        except Exception as e:
-            self.logger.error(f"Error scraping Sky Sports: {e}")
-        
-        return injuries
-    
-    def scrape_transfermarkt_injuries(self) -> List[Dict]:
-        """Scrape Transfermarkt injury page"""
-        self.logger.info("Scraping Transfermarkt injuries...")
-        injuries = []
-        
-        try:
-            # Direct link to Premier League injuries
-            url = "https://www.transfermarkt.com/premier-league/verletzungen/wettbewerb/GB1"
-            response = self.session.get(url, timeout=10)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.content, 'lxml')
-            
-            tables = soup.select('table.items')
-            
-            for table in tables:
-                rows = table.select('tbody tr')
-                
-                for row in rows:
-                    try:
-                        cells = row.find_all('td')
-                        if len(cells) >= 3:
-                            # Player name is usually in the first or second cell
-                            player_cell = cells[0] if len(cells[0].get_text(strip=True)) > 5 else cells[1]
-                            player_name = player_cell.get_text(strip=True)
-                            
-                            # Clean player name
-                            player_name = re.sub(r'\d+', '', player_name).strip()
-                            player_name = re.sub(r'#\d+', '', player_name).strip()
-                            
-                            if self._is_valid_player_name(player_name):
-                                club = cells[1].get_text(strip=True) if len(cells) > 1 else 'Unknown'
-                                injury_type = cells[2].get_text(strip=True) if len(cells) > 2 else 'Unknown'
-                                expected_return = cells[3].get_text(strip=True) if len(cells) > 3 else 'Unknown'
-                                
-                                injury = {
-                                    'source': 'Transfermarkt',
-                                    'player': player_name,
-                                    'club': club,
-                                    'injury_type': injury_type,
-                                    'expected_return': expected_return,
-                                    'status': 'Injured',
-                                    'scraped_at': datetime.now().isoformat()
-                                }
-                                injuries.append(injury)
-                                self.logger.info(f"✅ {player_name} ({club}) - {injury_type}")
-                                
-                    except Exception as e:
-                        continue
-                        
-        except Exception as e:
-            self.logger.error(f"Error scraping Transfermarkt: {e}")
-        
-        return injuries
-    
-    def _parse_status(self, expected_return: str) -> str:
-        """Parse injury status from expected return text"""
-        text = expected_return.lower()
-        
-        if any(word in text for word in ['back', 'training', 'recovered']):
-            return 'Recovering'
-        elif any(word in text for word in ['weeks', 'months', 'long-term']):
-            return 'Long-term'
-        elif any(word in text for word in ['days', 'soon']):
-            return 'Short-term'
-        elif 'unknown' in text or 'tbc' in text:
-            return 'Unknown'
-        else:
-            return 'Active'
-    
-    def scrape_all_injuries(self) -> Dict:
-        """Scrape injuries from all sources"""
-        all_injuries = {
-            'player_injuries': [],
-            'injury_news': [],
-            'summary': {}
-        }
-        
-        sources = [
-            ('Premier League API', self.scrape_premier_league_api, 'player_injuries'),
-            ('ESPN Injuries', self.scrape_espn_injuries, 'player_injuries'),
-            ('Transfermarkt', self.scrape_transfermarkt_injuries, 'player_injuries'),
-            ('PhysioRoom', self.scrape_physioroom, 'player_injuries'),
-            ('Sky Sports News', self.scrape_sky_sports_injuries, 'injury_news')
-        ]
-        
-        for source_name, scraper_func, category in sources:
-            try:
-                self.logger.info(f"Starting scraping from {source_name}...")
-                results = scraper_func()
-                
-                if results:
-                    all_injuries[category].extend(results)
-                    self.logger.info(f"✅ {source_name}: {len(results)} items found")
-                else:
-                    self.logger.warning(f"⚠️ {source_name}: No data found")
-                
-                # Be polite - wait between requests
-                time.sleep(2)
-                
-            except Exception as e:
-                self.logger.error(f"❌ {source_name} failed: {e}")
-                continue
-        
-        # Generate summary
-        all_injuries['summary'] = {
-            'total_player_injuries': len(all_injuries['player_injuries']),
-            'total_news_articles': len(all_injuries['injury_news']),
-            'sources_scraped': len(sources),
-            'timestamp': datetime.now().isoformat()
-        }
-        
-        self.logger.info(f"\n📊 SUMMARY:")
-        self.logger.info(f"Total player injuries: {all_injuries['summary']['total_player_injuries']}")
-        self.logger.info(f"Total news articles: {all_injuries['summary']['total_news_articles']}")
-        
-        return all_injuries
-    
-    def save_to_json(self, data: Dict, filename: str = 'injuries_data.json'):
-        """Save scraped data to JSON file"""
         try:
             with open(filename, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-            self.logger.info(f"✅ Data saved to {filename}")
+                json.dump(player_data, f, indent=2, ensure_ascii=False)
+            self.logger.info(f"Data saved to {filename}")
         except Exception as e:
-            self.logger.error(f"Error saving to JSON: {e}")
+            self.logger.error(f"Error saving JSON: {e}")
+    
+    def save_as_csv(self, player_data: Dict, filename: str = None):
+        """Save player data as CSV (flattened for easier analysis)"""
+        if filename is None:
+            player_name = player_data['personal_info'].get('name', 'player')
+            safe_name = re.sub(r'[^\w\s]', '', player_name).replace(' ', '_')
+            filename = f"{safe_name}_{player_data['player_id']}.csv"
+        
+        try:
+            # Flatten the data structure
+            flat_data = {}
+            
+            # Basic info
+            flat_data['player_id'] = player_data['player_id']
+            flat_data['scraped_at'] = player_data['scraped_at']
+            
+            # Personal info
+            for key, value in player_data['personal_info'].items():
+                if isinstance(value, list):
+                    flat_data[key] = ', '.join(str(v) for v in value)
+                else:
+                    flat_data[key] = value
+            
+            # Club info
+            for key, value in player_data['club_info'].items():
+                flat_data[f'club_{key}'] = value
+            
+            # Market value
+            for key, value in player_data['market_value'].items():
+                if key == 'value_history':
+                    continue
+                flat_data[f'value_{key}'] = value
+            
+            # Create CSV
+            import csv
+            with open(filename, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=flat_data.keys())
+                writer.writeheader()
+                writer.writerow(flat_data)
+            
+            self.logger.info(f"CSV data saved to {filename}")
+            
+        except Exception as e:
+            self.logger.error(f"Error saving CSV: {e}")
 
-def main():
-    """Main execution function"""
-    scraper = InjuryScraper()
-    
-    print("=" * 60)
-    print("🏥 FOOTBALL INJURY SCRAPER")
-    print("=" * 60)
-    
-    # Scrape all sources
-    results = scraper.scrape_all_injuries()
-    
-    # Save results
-    scraper.save_to_json(results)
-    
-    print("\n" + "=" * 60)
-    print("✅ SCRAPING COMPLETE")
-    print("=" * 60)
-    print(f"Total Player Injuries: {results['summary']['total_player_injuries']}")
-    print(f"Total News Articles: {results['summary']['total_news_articles']}")
-    print(f"Data saved to: injuries_data.json")
-    print("=" * 60)
 
+# Usage example
 if __name__ == "__main__":
-    main()
+    # Initialize scraper
+    scraper = AdvancedTransfermarktScraper(use_cloudscraper=True)
+    
+    # Scrape a player
+    player_id = "398073"  # Achraf Hakimi
+    
+    try:
+        player_data = scraper.scrape_player(player_id)
+        
+        # Save results
+        scraper.save_as_json(player_data)
+        scraper.save_as_csv(player_data)
+        
+        # Print summary
+        print(f"\n✅ Successfully scraped: {player_data['personal_info'].get('name')}")
+        print(f"📊 Appearances: {sum(int(stat['appearances']) for stat in player_data['career_stats'] if stat['appearances'])}")
+        print(f"⚽ Goals: {sum(int(stat['goals']) for stat in player_data['career_stats'] if stat['goals'])}")
+        print(f"🔄 Transfers: {len(player_data['transfers'])}")
+        print(f"🏥 Injuries: {len(player_data['injury_history'])}")
+        
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        scraper.logger.error(f"Main execution failed: {e}")

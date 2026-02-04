@@ -1,0 +1,6 @@
+2026/01/27-12:43:01.971 344a48 Reusing MANIFEST /Users/mac/Downloads/web-scraping-master/facebook_session/Default/Local Storage/leveldb/MANIFEST-000001
+2026/01/27-12:43:01.975 344a48 Recovering log #3
+2026/01/27-12:43:01.975 344a48 Reusing old log /Users/mac/Downloads/web-scraping-master/facebook_session/Default/Local Storage/leveldb/000003.log 
+2026/01/27-12:52:03.348 344a4b Level-0 table #5: started
+2026/01/27-12:52:03.361 344a4b Level-0 table #5: 97861 bytes OK
+2026/01/27-12:52:03.371 344a4b Delete type=0 #3
