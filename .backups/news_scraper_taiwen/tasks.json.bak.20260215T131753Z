@@ -1,0 +1,84 @@
+{
+  "tasks": [
+    {
+      "language": "fr",
+      "country": "DZ",
+      "label": "Algeria_Top10",
+      "keywords": [
+        "site:dzfoot.com CAN 2026",
+        "site:competition.dz CAN 2026",
+        "site:lescore.dz CAN 2026",
+        "site:lebuteur.com CAN 2026",
+        "site:observalgerie.com CAN 2026",
+        "site:tsa-algerie.com CAN 2026",
+        "site:liberte-algerie.com CAN 2026",
+        "site:elwatan.com CAN 2026",
+        "site:horizons.dz CAN 2026",
+        "Mahrez blessure CAN 2026",
+        "Slimani CAN 2026 préparation"
+      ]
+    },
+    {
+      "language": "en",
+      "country": "EG",
+      "label": "Egypt_Top10",
+      "keywords": [
+        "site:filgoal.com AFCON 2026",
+        "site:kingfut.com AFCON 2026",
+        "site:alahram.org.eg AFCON 2026",
+        "site:egypttoday.com AFCON 2026",
+        "site:albawabhnews.com AFCON 2026",
+        "site:youm7.com AFCON 2026",
+        "site:masrawy.com AFCON 2026",
+        "Salah injury AFCON 2026",
+        "Egypt national team camp",
+        "Marmoush preparation CAN 2026"
+      ]
+    },
+    {
+      "language": "fr",
+      "country": "FR",
+      "label": "France_Top10",
+      "keywords": [
+        "site:lequipe.fr CAN 2026",
+        "site:france24.com CAN 2026",
+        "site:lemonde.fr CAN 2026",
+        "site:lefigaro.fr CAN 2026",
+        "site:rmcsport.bfmtv.com CAN 2026",
+        "site:eurosport.fr CAN 2026",
+        "site:sofoot.com CAN 2026",
+        "site:lunion.fr CAN 2026",
+        "site:letelegramme.fr CAN 2026",
+        "Egypte Algérie derby CAN 2026"
+      ]
+    },
+    {
+      "language": "ar",
+      "country": "EG",
+      "label": "Arabic_Media",
+      "keywords": [
+        "site:bein-sports.com كأس الأمم 2026",
+        "site:aljazeera.net أمم أفريقيا 2026",
+        "site:alarabiya.net أمم أفريقيا 2026",
+        "site:skynewsarabia.com أمم أفريقيا 2026",
+        "مصر الجزائر كان 2026",
+        "صلاح أمم أفريقيا 2026"
+      ]
+    },
+    {
+      "language": "en",
+      "country": "GB",
+      "label": "UK_Top10",
+      "keywords": [
+        "site:bbc.co.uk AFCON 2026",
+        "site:theguardian.com AFCON 2026",
+        "site:telegraph.co.uk AFCON 2026",
+        "site:skysports.com AFCON 2026",
+        "site:dailymail.co.uk AFCON 2026",
+        "site:mirror.co.uk AFCON 2026",
+        "Salah AFCON 2026",
+        "Mahrez Africa Cup"
+      ]
+    }
+  ]
+}

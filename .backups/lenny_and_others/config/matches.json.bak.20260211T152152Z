@@ -1,0 +1,46 @@
+{
+  "matches": [
+    {
+      "name": "AFCON général",
+      "terms": [
+        "afcon",
+        "AFCON 2026",
+        "CAN 2026",
+        "Africa Cup",
+        "Coupe d'Afrique"
+      ]
+    },
+    {
+      "name": "Morocco vs Senegal (final)",
+      "terms": [
+        "Morocco vs Senegal",
+        "Maroc Sénégal",
+        "Morocco Senegal final",
+        "Maroc contre Sénégal",
+        "final AFCON 2026"
+      ]
+    },
+    {
+      "name": "Joueurs Maroc",
+      "terms": [
+        "Achraf Hakimi",
+        "Hakimi",
+        "Hakim Ziyech",
+        "Ziyech",
+        "Youssef En-Nesyri",
+        "En-Nesyri"
+      ]
+    },
+    {
+      "name": "Joueurs Sénégal",
+      "terms": [
+        "Sadio Mane",
+        "Mane",
+        "Edouard Mendy",
+        "Mendy",
+        "Kalidou Koulibaly",
+        "Koulibaly"
+      ]
+    }
+  ]
+}

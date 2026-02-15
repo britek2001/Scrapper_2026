@@ -1,0 +1,13 @@
+{
+  "event_date": "18/01/2026",
+  "days_before": 3,
+  "days_after": 2,
+  "subreddit": "soccer",
+  "keywords": [
+    "AFCON",
+    "Morocco",
+    "Senegal"
+  ],
+  "delay": 2.0,
+  "output_dir": "reddit_data_18012026"
+}
