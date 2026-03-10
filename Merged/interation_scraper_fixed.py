@@ -9,7 +9,7 @@ import re
 import time
 import requests
 import logging
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
 from dataclasses import dataclass, asdict
@@ -427,6 +427,14 @@ class News_Scraper:
         self.use_external_parser = use_external_parser and EXTERNAL_PARSER_AVAILABLE
         self.session = requests.Session()
         self.session.headers.update(self.HEADERS)
+        # Additional defaults
+        self.timeout = 30
+        self.max_retries = 3
+        # add referer to help avoid simple blocking
+        try:
+            self.session.headers.update({'Referer': 'https://www.transfermarkt.com/'})
+        except Exception:
+            pass
         # Use datetime objects for GNews compatibility
         self.start_date = datetime(2023, 1, 1)
         self.end_date = datetime(2024, 12, 31)
@@ -592,14 +600,20 @@ class TransderMarkt_Scraper:
         'rueckennummern': 'kit_numbers'
     }
     
-    def __init__(self, use_playwright: bool = True, use_selenium: bool = True, delay: float = 1.0):
+    def __init__(self, use_playwright: bool = True, use_selenium: bool = True, delay: float = 1.0,
+                 follow_links: bool = False, follow_patterns: Optional[List[str]] = None, max_follow_links: int = 20):
         self.conf = Config()
         self.use_playwright = use_playwright and PLAYWRIGHT_AVAILABLE
         self.use_selenium = use_selenium
         self.delay = delay
         self.session = requests.Session()
         self.session.headers.update(self.HEADERS)
-        
+
+        # Link-following options
+        self.follow_links = follow_links
+        self.follow_patterns = follow_patterns or []
+        self.max_follow_links = max_follow_links
+
         # Setup directories
         self.base_directory = os.path.join(os.getcwd(), "transfermarkt_data")
         self.data_directory = os.path.join(self.base_directory, "data")
@@ -610,6 +624,76 @@ class TransderMarkt_Scraper:
 
         for folder in [self.base_directory, self.data_directory, self.player_data_directory]:
             os.makedirs(folder, exist_ok=True)
+
+    def _normalize_and_filter_link(self, href: str, base_url: str) -> Optional[str]:
+        """Normalize href to absolute URL and filter obvious noise."""
+        try:
+            if not href or href.strip() == '':
+                return None
+            href = href.strip()
+            # skip javascript/mailto anchors
+            if href.startswith('javascript:') or href.startswith('mailto:') or href.startswith('#'):
+                return None
+            # convert relative to absolute
+            if href.startswith('/'):
+                full = urljoin('https://www.transfermarkt.com', href)
+            elif href.startswith('http'):
+                full = href
+            else:
+                # relative without leading slash
+                full = urljoin(base_url, href)
+
+            parsed = urlparse(full)
+            # only follow transfermarkt domain by default
+            if 'transfermarkt.' not in parsed.netloc:
+                return None
+
+            # allow if explicit follow_patterns match
+            patterns = [p.lower() for p in (getattr(self, 'follow_patterns', []) or [])]
+            if patterns and any(pat in full.lower() for pat in patterns):
+                return full
+
+            # avoid large navigation sections by simple heuristics (keep statistik out of blanket exclusion)
+            lower = parsed.path.lower()
+            if any(prefix in lower for prefix in ['/navigation', '/detailsuche', '/aktuell', '/rumour-mill', '/betting', '/intern']):
+                return None
+
+            return full
+        except Exception:
+            return None
+
+    def parse_generic_page(self, html: str, url: str) -> Dict[str, Any]:
+        """Basic generic parser for followed linked pages (title, h1, paragraphs, small tables)."""
+        soup = BeautifulSoup(html, 'html.parser')
+        try:
+            # remove scripts/styles/navigation
+            for el in soup.find_all(['script', 'style', 'nav', 'footer', 'header']):
+                el.decompose()
+
+            title = soup.title.string.strip() if soup.title and soup.title.string else ''
+            h1s = [h.get_text(' ', strip=True) for h in soup.find_all('h1')][:3]
+            paragraphs = [p.get_text(' ', strip=True) for p in soup.find_all('p')][:3]
+
+            tables = []
+            for table in soup.find_all('table')[:3]:
+                rows = []
+                for tr in table.find_all('tr')[:20]:
+                    cols = [td.get_text(' ', strip=True) for td in tr.find_all(['td', 'th'])]
+                    if cols:
+                        rows.append(cols)
+                if rows:
+                    tables.append(rows)
+
+            return {
+                'url': url,
+                'title': title,
+                'h1': h1s,
+                'paragraphs': paragraphs,
+                'tables': tables
+            }
+        except Exception as e:
+            logger.debug(f"Generic parse error for {url}: {e}")
+            return {'url': url, 'error': str(e)}
     
     def extract_player_id_from_url(self, url: str) -> Optional[str]:
         """Extract player ID from Transfermarkt URL"""
@@ -665,26 +749,33 @@ class TransderMarkt_Scraper:
         time.sleep(self.delay)
         html_content = None
 
-        # Try requests first
-        try:
-            logger.info(f"Downloading {url}")
-            response = self.session.get(url, timeout=self.timeout)
-            if response.status_code == 200:
-                html_content = response.text
-                lower = html_content.lower()
-                invalid_indicators = [
-                    'player not found',
-                    'seite nicht gefunden',
-                    'page not found',
-                    'player nicht gefunden'
-                ]
-                if any(indicator in lower for indicator in invalid_indicators):
-                    logger.warning(f"Invalid page content for {url}")
-                    html_content = None
-            else:
-                logger.warning(f"Non-200 response {response.status_code} for {url}")
-        except Exception as e:
-            logger.debug(f"Requests fetch failed for {url}: {e}")
+        # Try requests with retries
+        for attempt in range(1, getattr(self, 'max_retries', 3) + 1):
+            try:
+                logger.info(f"Downloading {url} (attempt {attempt})")
+                response = self.session.get(url, timeout=getattr(self, 'timeout', 30))
+                status = getattr(response, 'status_code', None)
+                if status == 200:
+                    html_content = response.text
+                    lower = html_content.lower()
+                    invalid_indicators = [
+                        'player not found',
+                        'seite nicht gefunden',
+                        'page not found',
+                        'player nicht gefunden'
+                    ]
+                    if any(indicator in lower for indicator in invalid_indicators):
+                        logger.warning(f"Invalid page content for {url}")
+                        html_content = None
+                    else:
+                        break
+                else:
+                    logger.warning(f"Non-200 response {status} for {url}")
+            except Exception as e:
+                logger.debug(f"Requests fetch failed for {url} attempt {attempt}: {e}")
+
+            # backoff before next attempt
+            time.sleep(min(2 ** attempt, 10))
 
         # Playwright fallback (no disk writes)
         if not html_content and self.use_playwright and page_type not in ['news']:
@@ -1148,6 +1239,81 @@ class TransderMarkt_Scraper:
                 
                 time.sleep(self.delay)
             
+            # Optionally follow selected links found on the player's pages and parse them
+            if getattr(self, 'follow_links', False):
+                try:
+                    seen = set()
+                    linked_results = []
+                    patterns = [p.lower() for p in (self.follow_patterns or [])]
+
+                    # collect candidate hrefs from all pages' found_urls
+                    candidates = []
+                    for page_obj in player_data.get('pages', {}).values():
+                        if isinstance(page_obj, dict):
+                            furls = page_obj.get('found_urls') or []
+                        else:
+                            furls = []
+                        if isinstance(furls, list):
+                            for fu in furls:
+                                if isinstance(fu, dict):
+                                    href = fu.get('href')
+                                else:
+                                    href = fu
+                                if href:
+                                    candidates.append(href)
+
+                    for href in candidates:
+                        full = self._normalize_and_filter_link(href, base_url)
+                        if not full:
+                            continue
+                        if full in seen:
+                            continue
+                        # if patterns are provided, require at least one to match
+                        if patterns and not any(pat in full.lower() for pat in patterns):
+                            continue
+                        seen.add(full)
+                        logger.info(f"Following linked URL: {full}")
+                        linked_html = self.fetch_page(full, 'linked', player_id, slug)
+                        # fallback: try Playwright if available
+                        if not linked_html and getattr(self, 'use_playwright', False):
+                            try:
+                                logger.info(f"Requests failed, trying Playwright for {full}")
+                                linked_html = self.fetch_with_playwright(full)
+                            except Exception as e:
+                                logger.debug(f"Playwright fallback failed for {full}: {e}")
+                        # fallback: try Selenium if available
+                        if not linked_html and getattr(self, 'use_selenium', False):
+                            try:
+                                logger.info(f"Trying Selenium for linked page {full}")
+                                drv = setup_driver(headless=True)
+                                if drv:
+                                    try:
+                                        drv.get(full)
+                                        time.sleep(2)
+                                        linked_html = drv.page_source
+                                    finally:
+                                        try:
+                                            drv.quit()
+                                        except:
+                                            pass
+                            except Exception as e:
+                                logger.debug(f"Selenium fallback failed for {full}: {e}")
+
+                        if not linked_html:
+                            logger.info(f"Could not fetch linked URL: {full}")
+                            continue
+
+                        parsed = self.parse_generic_page(linked_html, full)
+                        linked_results.append(parsed)
+                        if len(linked_results) >= int(getattr(self, 'max_follow_links', 20)):
+                            break
+                        time.sleep(self.delay)
+
+                    if linked_results:
+                        player_data['pages']['linked_pages'] = linked_results
+                except Exception as e:
+                    logger.error(f"Error following links for {slug}: {e}")
+
             self.save_player_json(player_data, slug, player_id)
             all_player_data.append(player_data)
             
