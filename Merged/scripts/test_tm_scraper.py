@@ -30,7 +30,15 @@ def main():
     ]
 
     # Instantiate scraper: disable Playwright to keep testing simple
-    scraper = TransderMarkt_Scraper(use_playwright=False, use_selenium=False, delay=0.5)
+    # Enable follow_links for test and restrict to agent/berater patterns
+    scraper = TransderMarkt_Scraper(
+        use_playwright=False,
+        use_selenium=False,
+        delay=0.5,
+        follow_links=True,
+        follow_patterns=['agent-support', 'berater', 'statistik/endendevertraege'],
+        max_follow_links=10
+    )
 
     print(f"Running Transfermarkt scraper for {len(players)} player(s)...")
     results = scraper.execution_url_agentent(None, players)
