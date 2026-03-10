@@ -1,0 +1,28 @@
+# Core dependencies
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+selenium>=4.15.0
+lxml>=4.9.0
+html5lib>=1.1
+
+# Web scraping utilities
+html2text>=2020.1.16
+newspaper3k>=0.2.8
+feedparser>=6.0.0
+
+# Transfermarkt scraping
+playwright>=1.40.0  # Optional, for JavaScript-heavy pages
+gnews>=0.2.0        # For Google News scraping
+
+# Data processing
+pandas>=2.0.0       # For data manipulation (optional)
+numpy>=1.24.0       # For numerical operations (optional)
+
+# Web drivers (automatically managed)
+webdriver-manager>=4.0.0
+
+# Progress bars
+tqdm>=4.66.0
+
+# For Twitter/X alternatives (Nitter)
+cloudscraper>=1.2.0

@@ -1,65 +1,43 @@
-# Projet Web Scraping — Documentation
+## Hemos Generado una classe base a todos los scrapers con el fin the poder calcular como avanzan los difrentes 
 
-![Architecture](./Captura%20de%20pantalla%202026-02-12%20a%20las%2018.32.48.png)
+SCRAPER es la classe que implementaran todos los scrapers y tenfra la clase que tendran todos. 
 
-## .1 Architecture logicielle et pipeline de collecte
+Con el fin de usar classes simultaneamente. 
 
-Nous avons conçu une architecture logicielle modulaire permettant de réalimenter
-automatiquement les scrapers avec de nouvelles données. Cette approche facilite la mise
-à jour continue du corpus et garantit la reproductibilité d’autres analyses.
+## Hemos Generado un BatchProcessor 
 
-Les différents scrapers ont été développés selon une logique de résilience, reposant
-sur des fichiers de configuration au format JSON. Cette configuration centralisée permet
-d’adapter dynamiquement les paramètres de collecte (mots-clés, périodes temporelles,
-sources ou limites de requêtes) sans modifier directement le code source.
+Implementacion de la classe DataExporter con el din de guardar los diferentes elementos correctamente. 
 
-Par ailleurs, chaque module de collecte est exécuté de manière indépendante. Cette
-séparation fonctionnelle permet de limiter l’impact des erreurs : en cas d’échec d’un
-composant, les autres processus continuent de fonctionner normalement. Un mécanisme de
-reprise automatique assure également la continuité de la collecte après interruption.
+CSV --> POST,  NEWS
 
-Les données collectées sont ensuite normalisées et structurées afin d’alimenter un
-pipeline d’analyse dédié. Cette organisation facilite leur exploitation pour la
-génération automatique de visualisations et de graphiques analytiques, permettant
-d’illustrer de manière claire les dynamiques observées.
+JSON --> POST,  NEWS
 
-Cette architecture constitue ainsi une base robuste et évolutive pour l’analyse de flux
-informationnels en temps réel, tout en garantissant la qualité, la cohérence et
-l’exploitabilité des données.
+CSV  --> COMMENTS  
 
----
+## Hemos Generado un BatchProcessor 
 
-## Environnement virtuel (venv)
+Un Batch procesor tomara a cuenta los procesos de guardar informacion en la base ded datos. 
 
-Pour isoler les dépendances, créez et activez un environnement virtuel puis installez les requirements.
+Tomara como parametro : 
 
-Linux / macOS (bash/zsh):
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
-# Lancer le scraper
-python FACEBOOK_SELENIUM/facebook_infinite_scroll.py
-```
+    >  Scraper : Que es la identidad del Scraper que le vamos a pasar tomaremos como reference la clase Scraper padre de todas esas clases inferiores. 
 
-Windows (PowerShell):
-```powershell
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-# Lancer le scraper
-python .\FACEBOOK_SELENIUM\facebook_infinite_scroll.py
-```
+    > Fichero de salida escogido 
+    
+    > Un DataExporter que es una classe que se dedicara en escribir en los formatos csv o json correspondientes 
+    
+    > Tendremos dos ficheros para cada agente batch el status y el progress 
 
-Pour quitter l'environnement virtuel:
-```bash
-deactivate
-```
+LOAD PROGRESS 
+    HACE UN JSON LOAD, MOSTARNDO LA INFORMACION QUE TENEMOS 
 
----
+SAVE PROGRESS 
+    GUARDA EL PROGRESS  
 
-Executing a update : 
+SAVE STATS 
+    GUARDA LOS STATS 
 
-python3 tools/match_config_generator.py --match-config tools/central_config_example.json --non-interactive --name "AFCON_Egypt_vs_Algeria_2026" --queries "Egypt Algeria match report;AFCON Egypt Algeria highlights;Egypt vs Algeria full match"
+GET_BATCH_FILENAME 
+    DEVUELVE EL PATH DONDE ESTA LOS DATOS 
+
+PROCESS_BATCH 
