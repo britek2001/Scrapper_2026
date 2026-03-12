@@ -1,8 +1,3 @@
-"""
-Complete functional replacement for interation_scraper.py
-This provides a working implementation with all necessary classes and methods.
-"""
-
 import json
 import os
 import re
@@ -10,11 +5,12 @@ import time
 import requests
 import logging
 from urllib.parse import urlparse, urljoin
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
 from dataclasses import dataclass, asdict
 from bs4 import BeautifulSoup
-# optional external parser for Transfermarkt pages
+
+
 try:
     from transfermarkt_parser import (
         parse_profile as tm_parse_profile,
@@ -59,6 +55,367 @@ except ImportError:
     GNEWS_AVAILABLE = False
     logger.warning("GNews not available, news scraping disabled")
 
+# Helper for colored log output (green)
+def _green(msg: str) -> str:
+    return f"\033[92m{msg}\033[0m"
+
+if PLAYWRIGHT_AVAILABLE:
+    logger.info(_green("Playwright available — JS rendering enabled"))
+
+if GNEWS_AVAILABLE:
+    logger.info(_green("GNews available — news search enabled"))
+
+
+class MatchOrchestrator:
+    """Orchestrates multiple match scrapers with parallel execution"""
+    
+    def __init__(self, max_workers: int = 3, output_base_dir: str = "match_data"):
+        self.max_workers = max_workers
+        self.output_base_dir = output_base_dir
+        os.makedirs(output_base_dir, exist_ok=True)
+        self.config = Config()
+        
+    def load_matches(self, path: str = None) -> List[Dict]:
+        """Load match configurations from JSON file"""
+        # Try explicit path first, then common locations
+        candidates: List[str] = []
+        if path:
+            candidates.append(path)
+        base = os.path.dirname(__file__)
+        candidates.extend([
+            os.path.join(base, 'config', 'matches.json'),
+            os.path.join(base, 'conf', 'matches.json'),
+            os.path.join(base, 'matches.json')
+        ])
+
+        for p in candidates:
+            try:
+                if not p:
+                    continue
+                if os.path.exists(p):
+                    with open(p, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    try:
+                        logger.info(_green(f"Loaded matches from: {p}"))
+                    except Exception:
+                        logger.info(f"Loaded matches from: {p}")
+
+                    # Normalize possible formats (list or dict with 'matches')
+                    if isinstance(data, dict):
+                        if 'matches' in data and isinstance(data['matches'], list):
+                            return data['matches']
+                        # single-match dict -> wrap
+                        return [data]
+                    if isinstance(data, list):
+                        return data
+            except Exception as e:
+                logger.error(f"Error loading matches from {p}: {e}")
+
+        logger.error(f"No matches file found. Checked: {candidates}")
+        return []
+    
+    def create_match_configs(self, match: Dict) -> Tuple[Dict, Dict, Dict, Dict]:
+        """Create scraper-specific configs for a match"""
+        
+        # Create match-specific output directory
+        match_dir = os.path.join(self.output_base_dir, match['match_id'])
+        os.makedirs(match_dir, exist_ok=True)
+        
+        # 1. URLs config for this match
+        urls_config = []
+        for url in match.get('urls', []):
+            urls_config.append({
+                "url": url,
+                "category": f"match_{match['match_id']}"
+            })
+        
+        # Add team URLs
+        for team in [match['teams']['home'], match['teams']['away']]:
+            urls_config.extend([
+                {"url": f"https://www.bbc.com/sport/football/teams/{team.lower().replace(' ', '-')}", 
+                 "category": f"team_{match['match_id']}"},
+                {"url": f"https://www.skysports.com/{team.lower().replace(' ', '-')}", 
+                 "category": f"team_{match['match_id']}"}
+            ])
+        
+        # 2. Tasks config for this match
+        tasks_config = [{
+            "label": f"match_report_{match['match_id']}",
+            "keywords": match.get('search_keywords', []),
+            "language": "en",
+            "max_results": 30
+        }]
+        
+        # 3. Players config for this match
+        players_config = []
+        # You would need to have a mapping of player names to Transfermarkt URLs
+        player_url_map = {
+            "Robert Lewandowski": "https://www.transfermarkt.com/robert-lewandowski/profil/spieler/158023",
+            "Lamine Yamal": "https://www.transfermarkt.com/lamine-yamal/profil/spieler/1234567",
+            "Pedri": "https://www.transfermarkt.com/pedri/profil/spieler/683840",
+            "Bruno Guimarães": "https://www.transfermarkt.com/bruno-guimaraes/profil/spieler/123456",
+            "Alexander Isak": "https://www.transfermarkt.com/alexander-isak/profil/spieler/123457",
+            # Add more mappings as needed
+        }
+        
+        for player_name in match.get('key_players', []):
+            if player_name in player_url_map:
+                players_config.append({
+                    "url": player_url_map[player_name],
+                    "name": player_name,
+                    "club": match['teams']['home'] if player_name in match.get('key_players', [])[:5] else match['teams']['away']
+                })
+        
+        # 4. Comments config for this match
+        comments_config = {
+            "keywords": match.get('search_keywords', []) + [f"{match['teams']['home']} {match['teams']['away']}"],
+            "subreddits": match.get('subreddits', ['soccer', 'football']),
+            "match_specific": {
+                "team1": match['teams']['home'],
+                "team2": match['teams']['away'],
+                "date": match['date'],
+                "competition": match['competition']
+            },
+            "include_comments": True,
+            "max_comments_per_post": 100
+        }
+        
+        return urls_config, tasks_config, players_config, comments_config
+    
+    def run_match_scraper(self, match: Dict, driver: Any) -> Dict:
+        """Run all scrapers for a single match"""
+        match_id = match['match_id']
+        logger.info(f"\n{'='*70}")
+        logger.info(f"STARTING SCRAPING FOR MATCH: {match['name']} ({match_id})")
+        logger.info(f"{'='*70}")
+        
+        # Create match-specific configs
+        urls_config, tasks_config, players_config, comments_config = self.create_match_configs(match)
+        
+        # Create match-specific output directory
+        match_output_dir = os.path.join(self.output_base_dir, match_id)
+        original_output_dir = self.config.output_directory
+        self.config.output_directory = match_output_dir  # Temporarily override
+        
+        match_results = {
+            'match_id': match_id,
+            'match_name': match['name'],
+            'date': match['date'],
+            'competition': match['competition'],
+            'teams': match['teams'],
+            'scraped_at': datetime.utcnow().isoformat() + 'Z',
+            'url_scraping': [],
+            'news_scraping': [],
+            'player_scraping': [],
+            'reddit_scraping': {'posts': 0, 'comments': 0}
+        }
+        
+        try:
+            # 1. URL Extraction
+            if urls_config:
+                logger.info(f"\n--- URL Extraction for {match_id} ---")
+                url_scraper = Urls_Extraction()
+                url_results = url_scraper.execution_url_agentent(driver, urls_config)
+                match_results['url_scraping'] = url_results
+                
+                # Save match-specific URL results
+                self.save_match_results(url_results, match_id, 'urls')
+            
+            # 2. News Scraping
+            if tasks_config and GNEWS_AVAILABLE:
+                logger.info(f"\n--- News Scraping for {match_id} ---")
+                news_scraper = News_Scraper()
+                # Override GNews dates to focus on match date
+                match_date = datetime.strptime(match['date'], '%Y-%m-%d')
+                news_scraper.start_date = match_date - timedelta(days=1)
+                news_scraper.end_date = match_date + timedelta(days=2)
+                
+                news_results = news_scraper.scrape_news_with_found_urls(driver, tasks_config, recursive_scrape=True)
+                match_results['news_scraping'] = news_results
+                self.save_match_results(news_results, match_id, 'news')
+            
+            # 3. Transfermarkt Scraping (for key players)
+            if players_config:
+                logger.info(f"\n--- Player Data Scraping for {match_id} ---")
+                try:
+                    names = [p.get('name') for p in players_config]
+                    logger.info(_green(f"Transfermarkt: scraping players: {', '.join([n for n in names if n])}"))
+                except Exception:
+                    pass
+                player_scraper = TransderMarkt_Scraper(delay=2.0)  # Slower for player data
+                player_results = player_scraper.execution_url_agentent(driver, players_config)
+                match_results['player_scraping'] = player_results
+                self.save_match_results(player_results, match_id, 'players')
+            
+            # 4. Reddit Scraping
+            if comments_config:
+                logger.info(f"\n--- Reddit Scraping for {match_id} ---")
+                # Save comments config temporarily
+                temp_config_path = os.path.join(match_output_dir, f"comment_{match_id}.json")
+                with open(temp_config_path, 'w') as f:
+                    json.dump(comments_config, f)
+                
+                reddit_scraper = Redit_Twitter_Scraper(keywords_file=temp_config_path)
+                reddit_scraper.subreddits = comments_config['subreddits']
+                try:
+                    k = comments_config.get('keywords', [])
+                    s = comments_config.get('subreddits', [])
+                    logger.info(_green(f"Reddit: using keywords={k} subreddits={s}"))
+                except Exception:
+                    pass
+                
+                # Scrape by keywords
+                posts = reddit_scraper.scrape_by_keywords(per_keyword_limit=50)
+                match_results['reddit_scraping']['posts'] = len(posts)
+                match_results['reddit_scraping']['comments'] = sum(p.num_comments for p in posts)
+                
+                self.save_match_results([p.to_dict() for p in posts], match_id, 'reddit')
+            
+            # Save complete match results
+            self.save_match_results(match_results, match_id, 'complete')
+            
+        except Exception as e:
+            logger.error(f"Error scraping match {match_id}: {e}")
+            match_results['error'] = str(e)
+        
+        # Restore original output directory
+        self.config.output_directory = original_output_dir
+        
+        logger.info(f"\n{'='*70}")
+        logger.info(f"COMPLETED MATCH: {match['name']}")
+        logger.info(f"Results saved to: {match_output_dir}")
+        logger.info(f"{'='*70}")
+        
+        return match_results
+    
+    def save_match_results(self, data: Any, match_id: str, data_type: str) -> None:
+        """Save match-specific results"""
+        match_dir = os.path.join(self.output_base_dir, match_id)
+        os.makedirs(match_dir, exist_ok=True)
+        
+        timestamp = int(time.time())
+        filename = f"{data_type}_{match_id}_{timestamp}.json"
+        filepath = os.path.join(match_dir, filename)
+        
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            logger.info(f"Saved {data_type} data to {filepath}")
+        except Exception as e:
+            logger.error(f"Error saving {data_type} data: {e}")
+    
+    def run_parallel_matches(self, matches: List[Dict]) -> List[Dict]:
+        """Run multiple matches in parallel using threading"""
+        import threading
+        from queue import Queue
+        
+        results = []
+        results_lock = threading.Lock()
+        
+        def worker(match: Dict, worker_id: int):
+            """Worker thread function"""
+            logger.info(f"Worker {worker_id} starting match: {match['name']}")
+            
+            # Create a new driver for this thread
+            driver = setup_driver()
+            if not driver:
+                logger.error(f"Worker {worker_id} failed to create driver")
+                return
+            
+            try:
+                match_result = self.run_match_scraper(match, driver)
+                with results_lock:
+                    results.append(match_result)
+            finally:
+                driver.quit()
+        
+        # Create and start threads
+        threads = []
+        for i, match in enumerate(matches):
+            if not match.get('active', True):
+                logger.info(f"Skipping inactive match: {match['name']}")
+                continue
+                
+            thread = threading.Thread(target=worker, args=(match, i+1))
+            threads.append(thread)
+            thread.start()
+            
+            # Limit concurrent threads
+            if len(threads) >= self.max_workers:
+                for t in threads:
+                    t.join()
+                threads = []
+        
+        # Wait for remaining threads
+        for thread in threads:
+            thread.join()
+        
+        return results
+    
+    def run_sequential_matches(self, matches: List[Dict]) -> List[Dict]:
+        """Run multiple matches sequentially"""
+        results = []
+        driver = setup_driver()
+        
+        if not driver:
+            logger.error("Failed to create driver")
+            return results
+        
+        try:
+            for match in matches:
+                if not match.get('active', True):
+                    logger.info(f"Skipping inactive match: {match['name']}")
+                    continue
+                    
+                match_result = self.run_match_scraper(match, driver)
+                results.append(match_result)
+                
+                # Pause between matches
+                time.sleep(10)
+        finally:
+            driver.quit()
+        
+        return results
+    
+    def generate_master_report(self, all_results: List[Dict]) -> None:
+        """Generate a master report for all matches"""
+        report = {
+            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "total_matches": len(all_results),
+            "matches": []
+        }
+        
+        for result in all_results:
+            match_summary = {
+                "match_id": result['match_id'],
+                "match_name": result['match_name'],
+                "date": result['date'],
+                "competition": result['competition'],
+                "teams": result['teams'],
+                "stats": {
+                    "urls_scraped": len(result.get('url_scraping', [])),
+                    "news_articles": len(result.get('news_scraping', [])),
+                    "players_processed": len(result.get('player_scraping', [])),
+                    "reddit_posts": result.get('reddit_scraping', {}).get('posts', 0),
+                    "reddit_comments": result.get('reddit_scraping', {}).get('comments', 0)
+                },
+                "output_directory": os.path.join(self.output_base_dir, result['match_id'])
+            }
+            report['matches'].append(match_summary)
+        
+        # Save master report
+        report_path = os.path.join(self.output_base_dir, f"master_report_{int(time.time())}.json")
+        with open(report_path, 'w') as f:
+            json.dump(report, f, indent=2)
+        
+        logger.info(f"\n{'='*70}")
+        logger.info("MASTER REPORT GENERATED")
+        logger.info(f"Total matches processed: {len(all_results)}")
+        for match in report['matches']:
+            logger.info(f"  - {match['match_name']}: {match['stats']['urls_scraped']} URLs, {match['stats']['news_articles']} articles, {match['stats']['reddit_posts']} posts")
+        logger.info(f"Report saved to: {report_path}")
+        logger.info(f"{'='*70}")
+
 
 class Config:
     """Configuration class for all scrapers"""
@@ -66,13 +423,25 @@ class Config:
     def __init__(self):
         self.output_directory = 'content_output'
         self.batch_size = 100
+        # Allow overriding posts per batch via env var POSTS_PER_BATCH
+        try:
+            env_bs = os.environ.get('POSTS_PER_BATCH')
+            if env_bs is not None and str(env_bs).strip() != '':
+                self.batch_size = int(env_bs)
+        except Exception:
+            pass
         self.delay_between_requests = 1.0
         self.max_content_length = 10000
         self.browser_user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         self.request_timeout = 30
+        # Limit number of batches saved per match (0 = unlimited). Can be set via env var MAX_BATCHES_PER_MATCH
+        try:
+            self.max_batches_per_match = int(os.environ.get('MAX_BATCHES_PER_MATCH', '0') or 0)
+        except Exception:
+            self.max_batches_per_match = 0
+        self._batches_written = 0
         
     def load_config(self, path: Optional[str] = None) -> List[Any]:
-        """Load configuration from JSON file"""
         if not path:
             path = os.path.join(os.path.dirname(__file__), 'config', 'urls.json')
         try:
@@ -110,6 +479,11 @@ class Config:
     def save_batch(self, batch: List[Dict], output_dir: str, start_idx: int, end_idx: int, timestamp: int) -> None:
         """Save a batch of results to file"""
         os.makedirs(output_dir, exist_ok=True)
+        # Respect max batches per match setting
+        if self.max_batches_per_match and self._batches_written >= self.max_batches_per_match:
+            logger.info(f"Max batches per match reached ({self.max_batches_per_match}), skipping save for {start_idx}-{end_idx}")
+            return
+
         filename = f"batch_{timestamp}_{start_idx:05d}-{end_idx:05d}.json"
         filepath = os.path.join(output_dir, filename)
         
@@ -117,6 +491,11 @@ class Config:
             with open(filepath, 'w', encoding='utf-8') as f:
                 json.dump(batch, f, ensure_ascii=False, indent=2)
             logger.info(f"Saved batch {start_idx}-{end_idx} to {filepath}")
+            # increment counter after successful save
+            try:
+                self._batches_written += 1
+            except Exception:
+                pass
         except Exception as e:
             logger.error(f"Error saving batch: {e}")
     
@@ -409,6 +788,124 @@ class Urls_Extraction:
         
         return all_results
 
+    def scrape_found_urls_universal(self, driver: Any, source_item: Dict, max_depth: int = 1, max_urls: int = 30) -> Dict:
+        """
+        Universal method to scrape found URLs from any source item (URL extraction or news extraction)
+
+        Args:
+            driver: Selenium WebDriver instance
+            source_item: The source item containing found_urls (from either scraper)
+            max_depth: Maximum depth to follow links
+            max_urls: Maximum number of URLs to scrape
+
+        Returns:
+            Dict: Enhanced item with nested scraped data
+        """
+        # Check if the item has found_urls (works for both URL and News results)
+        if not source_item.get('found_urls'):
+            return source_item
+
+        # Initialize the enhanced result
+        enhanced_item = source_item.copy()
+        enhanced_item['scraped_urls'] = []
+        enhanced_item['scraping_stats'] = {
+            'total_attempted': 0,
+            'successful': 0,
+            'failed': 0,
+            'filtered_out': 0
+        }
+
+        # Track visited URLs to avoid duplicates
+        visited_urls = set()
+
+        # Get source information
+        source_url = source_item.get('url', 'unknown')
+        source_category = source_item.get('category', source_item.get('source_label', 'unknown'))
+        source_title = source_item.get('title', '')
+
+        urls_to_scrape = source_item['found_urls'][:max_urls]
+
+        logger.info(f"Scraping {len(urls_to_scrape)} found URLs from: {source_url[:80]}...")
+
+        # Patterns to filter out (common non-article URLs)
+        skip_patterns = [
+            'facebook.com', 'twitter.com', 'x.com', 'instagram.com', 'youtube.com',
+            'tiktok.com', 'reddit.com', 'linkedin.com', 'pinterest.com',
+            'login', 'signin', 'register', 'signup', 'subscribe',
+            'privacy', 'terms', 'cookie', 'gdpr',
+            '.pdf', '.jpg', '.png', '.gif', '.mp4',
+            'shop.', 'store.', 'checkout', 'cart',
+            'javascript:', 'mailto:', 'tel:',
+            '#comments', '#respond', '#reply'
+        ]
+
+        for i, url in enumerate(urls_to_scrape, 1):
+            if url in visited_urls:
+                continue
+            visited_urls.add(url)
+
+            # Skip non-http URLs and unwanted patterns
+            if not url.startswith('http'):
+                enhanced_item['scraping_stats']['filtered_out'] += 1
+                continue
+
+            if any(pattern in url.lower() for pattern in skip_patterns):
+                enhanced_item['scraping_stats']['filtered_out'] += 1
+                continue
+
+            # Prefer same-domain URLs (more likely to be relevant articles)
+            source_domain = urlparse(source_url).netloc
+            url_domain = urlparse(url).netloc
+
+            enhanced_item['scraping_stats']['total_attempted'] += 1
+
+            try:
+                # Extract content from the found URL
+                result = self.extract_domain(driver, url)
+
+                # Add reference information
+                result['found_from'] = {
+                    'url': source_url,
+                    'title': source_title[:100] if source_title else '',
+                    'category': source_category
+                }
+                result['depth'] = 1
+                result['is_same_domain'] = (source_domain == url_domain)
+
+                # Add to scraped_urls list
+                enhanced_item['scraped_urls'].append(result)
+
+                if result.get('success'):
+                    enhanced_item['scraping_stats']['successful'] += 1
+                else:
+                    enhanced_item['scraping_stats']['failed'] += 1
+
+                logger.info(f"  [{i}/{len(urls_to_scrape)}] Scraped: {url[:60]}... ({'✓' if result.get('success') else '✗'})")
+
+                # Rate limiting
+                if i < len(urls_to_scrape):
+                    time.sleep(self.conf.delay_between_requests)
+
+            except Exception as e:
+                logger.error(f"  Error scraping {url[:60]}...: {str(e)[:50]}")
+                enhanced_item['scraped_urls'].append({
+                    'url': url,
+                    'found_from': {
+                        'url': source_url,
+                        'title': source_title[:100] if source_title else '',
+                        'category': source_category
+                    },
+                    'success': False,
+                    'error': str(e)
+                })
+                enhanced_item['scraping_stats']['failed'] += 1
+
+        logger.info(f"Completed: {enhanced_item['scraping_stats']['successful']} successful, "
+                    f"{enhanced_item['scraping_stats']['failed']} failed, "
+                    f"{enhanced_item['scraping_stats']['filtered_out']} filtered")
+
+        return enhanced_item
+
 
 class News_Scraper:
     """Scrapes news articles using GNews"""
@@ -442,6 +939,17 @@ class News_Scraper:
         self.languages = ['fr']
         self.countries = ['US', 'FR', 'DE', 'ES', 'IT']
         self.labels = ['france', 'usa', 'germany', 'spain', 'italy']
+        # Informational logs in green when optional features are active for this instance
+        try:
+            if self.use_playwright:
+                logger.info(_green("News_Scraper: Playwright enabled for JS rendering"))
+        except Exception:
+            pass
+        try:
+            if GNEWS_AVAILABLE:
+                logger.info(_green("News_Scraper: GNews available and will be used"))
+        except Exception:
+            pass
     
     def resolve_real_url(self, driver: Any, google_url: str) -> str:
         """Resolve Google redirect URL to actual URL"""
@@ -496,6 +1004,10 @@ class News_Scraper:
                     start_date=self.start_date,
                     end_date=self.end_date
                 )
+                try:
+                    logger.info(_green("News_Scraper: using GNews for keyword searches"))
+                except Exception:
+                    pass
                 
                 for keyword in keywords:
                     try:
@@ -514,10 +1026,46 @@ class News_Scraper:
                             real_url = self.resolve_real_url(driver, google_url)
                             if "google.com" in real_url:
                                 continue
-                            
                             seen_titles.add(title)
+
+                            # Try to fetch the article page to extract found hrefs
+                            found_urls: List[str] = []
+                            page_html_saved: Optional[str] = None
+                            try:
+                                resp = self.session.get(real_url, timeout=self.timeout)
+                                if resp.ok:
+                                    page_html = resp.text
+                                    page_html_saved = page_html if self.store_html else None
+                                    soup = BeautifulSoup(page_html, 'html.parser')
+                                    anchors = soup.find_all('a', href=True)
+                                    for a in anchors:
+                                        href = a.get('href', '').strip()
+                                        if not href:
+                                            continue
+                                        if href.startswith('#') or href.startswith('javascript:') or href.startswith('mailto:'):
+                                            continue
+                                        abs_url = urljoin(real_url, href)
+                                        parsed = urlparse(abs_url)
+                                        if parsed.scheme not in ('http', 'https'):
+                                            continue
+                                        if any(ext in abs_url.lower() for ext in ('.jpg', '.jpeg', '.png', '.gif', '.pdf', '.mp4')):
+                                            continue
+                                        found_urls.append(abs_url)
+                                    # dedupe while preserving order
+                                    seen_u = set()
+                                    deduped = []
+                                    for u in found_urls:
+                                        if u in seen_u:
+                                            continue
+                                        seen_u.add(u)
+                                        deduped.append(u)
+                                    found_urls = deduped[:50]
+                            except Exception:
+                                # ignore link-extraction failures
+                                found_urls = []
+
                             full_text = self.get_content_from_url(real_url)
-                            
+
                             if full_text and len(full_text) > 200:
                                 all_data.append({
                                     'url': real_url,
@@ -529,6 +1077,8 @@ class News_Scraper:
                                     'content': full_text,
                                     'word_count': len(full_text.split()),
                                     'line_count': len(full_text.split('. ')),
+                                    'found_urls': found_urls,
+                                    'html': page_html_saved,
                                     'success': True
                                 })
                                 
@@ -564,6 +1114,107 @@ class News_Scraper:
                     pass
         
         return all_data
+
+    def scrape_news_with_found_urls(self, driver: Any, tasks: List[Dict], recursive_scrape: bool = True) -> List[Dict]:
+        """
+        Enhanced news scraper that also scrapes found URLs from news articles
+
+        Args:
+            driver: Selenium WebDriver instance
+            tasks: List of news scraping tasks
+            recursive_scrape: Whether to recursively scrape found URLs
+
+        Returns:
+            List[Dict]: Enhanced news results with nested scraped URLs
+        """
+        if not GNEWS_AVAILABLE:
+            logger.error("GNews not available, cannot scrape news")
+            return []
+
+        # First, get regular news results
+        news_results = self.execution_url_agentent(driver, tasks)
+
+        if not recursive_scrape or not news_results:
+            return news_results
+
+        # Create URL extractor instance for scraping found URLs
+        url_extractor = Urls_Extraction()
+        enhanced_results = []
+
+        logger.info(f"\n{'='*60}")
+        logger.info(f"RECURSIVELY SCRAPING FOUND URLS FROM {len(news_results)} NEWS ARTICLES")
+        logger.info(f"{'='*60}")
+
+        for i, news_item in enumerate(news_results, 1):
+            if not news_item.get('success'):
+                enhanced_results.append(news_item)
+                continue
+
+            logger.info(f"\nProcessing news article {i}/{len(news_results)}: {news_item.get('title', '')[:80]}...")
+
+            # Use the universal scraper method
+            enhanced_item = url_extractor.scrape_found_urls_universal(
+                driver=driver,
+                source_item=news_item,
+                max_depth=1,
+                max_urls=20  # Limit to 20 URLs per news article
+            )
+
+            enhanced_results.append(enhanced_item)
+
+            # Save batch periodically
+            if i % 10 == 0:
+                self.save_enhanced_news_batch(enhanced_results[-10:], i-9, i)
+
+        # Save all enhanced results
+        self.save_all_enhanced_news(enhanced_results)
+
+        return enhanced_results
+
+    def save_enhanced_news_batch(self, batch: List[Dict], start_idx: int, end_idx: int) -> None:
+        """Save a batch of enhanced news results"""
+        timestamp = int(time.time())
+        filename = f"enhanced_news_batch_{timestamp}_{start_idx:04d}-{end_idx:04d}.json"
+        filepath = os.path.join(self.conf.output_directory, filename)
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(batch, f, ensure_ascii=False, indent=2)
+            logger.info(f"Saved enhanced news batch {start_idx}-{end_idx} to {filename}")
+        except Exception as e:
+            logger.error(f"Error saving enhanced news batch: {e}")
+
+    def save_all_enhanced_news(self, enhanced_results: List[Dict]) -> None:
+        """Save all enhanced news results with metadata"""
+        timestamp = int(time.time())
+        filename = f"all_enhanced_news_{timestamp}.json"
+        filepath = os.path.join(self.conf.output_directory, filename)
+
+        # Calculate statistics
+        total_main_articles = len(enhanced_results)
+        total_scraped_urls = sum(len(item.get('scraped_urls', [])) for item in enhanced_results)
+        total_successful = sum(
+            item.get('scraping_stats', {}).get('successful', 0)
+            for item in enhanced_results if 'scraping_stats' in item
+        )
+
+        output_data = {
+            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "statistics": {
+                "total_main_articles": total_main_articles,
+                "total_scraped_urls": total_scraped_urls,
+                "total_successful_scrapes": total_successful,
+                "average_urls_per_article": round(total_scraped_urls / total_main_articles, 2) if total_main_articles > 0 else 0
+            },
+            "results": enhanced_results
+        }
+
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(output_data, f, ensure_ascii=False, indent=2)
+            logger.info(f"All enhanced news saved to {filename}")
+            logger.info(f"Statistics: {total_main_articles} articles, {total_scraped_urls} scraped URLs, {total_successful} successful")
+        except Exception as e:
+            logger.error(f"Error saving all enhanced news: {e}")
 
 
 class TransderMarkt_Scraper:
@@ -731,6 +1382,7 @@ class TransderMarkt_Scraper:
             return None
         
         try:
+            logger.info(_green(f"Playwright fetching: {url[:80]}"))
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=True)
                 page = browser.new_page()
@@ -1818,7 +2470,7 @@ class Redit_Twitter_Scraper:
         return results
 
 
-def main() -> None:
+def main_single() -> None:
     """Main function to orchestrate all scrapers"""
     logger.info("Starting main scraping process...")
     
@@ -1910,5 +2562,44 @@ def main() -> None:
     logger.info("="*60)
 
 
+def main_parallel() -> None:
+    """Main function to run multiple match scrapers in parallel"""
+    logger.info("="*70)
+    logger.info("MULTI-MATCH SCRAPING ORCHESTRATOR STARTING")
+    logger.info("="*70)
+    
+    # Create orchestrator
+    orchestrator = MatchOrchestrator(max_workers=3, output_base_dir="match_data")
+    
+    # Load matches
+    matches = orchestrator.load_matches()
+    
+    if not matches:
+        logger.error("No matches found to scrape")
+        return
+    
+    logger.info(f"Loaded {len(matches)} matches:")
+    for match in matches:
+        logger.info(f"  - {match['name']} ({match['date']}) - {'ACTIVE' if match.get('active', True) else 'INACTIVE'}")
+    
+    # Choose execution mode
+    use_parallel = True  # Set to False for sequential execution
+    
+    if use_parallel:
+        logger.info("\nRunning in PARALLEL mode")
+        all_results = orchestrator.run_parallel_matches(matches)
+    else:
+        logger.info("\nRunning in SEQUENTIAL mode")
+        all_results = orchestrator.run_sequential_matches(matches)
+    
+    # Generate master report
+    orchestrator.generate_master_report(all_results)
+    
+    logger.info("\n" + "="*70)
+    logger.info("ALL MATCH SCRAPING COMPLETE!")
+    logger.info("="*70)
+
+
 if __name__ == "__main__":
-    main()
+    main_single()  # For single match
+    #main_parallel()  # For multiple matches
